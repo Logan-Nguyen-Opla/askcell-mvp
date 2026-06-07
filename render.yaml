@@ -1,0 +1,22 @@
+# Render Blueprint for the AskCell backend (FastAPI / uvicorn).
+# The frontend is deployed separately on Vercel.
+#
+# After importing this blueprint, set the two `sync: false` secrets in the
+# Render dashboard:
+#   GEMINI_API_KEY   -> your AIzaSy... key
+#   ALLOWED_ORIGINS  -> your Vercel URL, e.g. https://askcell.vercel.app
+services:
+  - type: web
+    name: askcell-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      - key: GEMINI_API_KEY
+        sync: false   # set in dashboard (secret)
+      - key: ALLOWED_ORIGINS
+        sync: false   # set to your Vercel URL once the frontend is live

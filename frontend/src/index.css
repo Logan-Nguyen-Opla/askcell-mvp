@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* fixed 100vh/100vw workspace, no window scrollbars */
+}
+
+body {
+  background-color: #020617; /* slate-950 */
+  color: #e2e8f0; /* slate-200 */
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, dark scrollbar for the chat transcript */
+.askcell-scroll::-webkit-scrollbar {
+  width: 7px;
+}
+.askcell-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.askcell-scroll::-webkit-scrollbar-thumb {
+  background: #1e293b; /* slate-800 */
+  border-radius: 9999px;
+}
+.askcell-scroll::-webkit-scrollbar-thumb:hover {
+  background: #334155; /* slate-700 */
+}

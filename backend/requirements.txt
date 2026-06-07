@@ -1,0 +1,25 @@
+# AskCell backend — works on Python 3.10 through 3.13.
+# All packages below ship pre-built wheels, so NO C compiler is required.
+
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20        # required by FastAPI for multipart/form-data uploads
+python-dotenv==1.0.1
+
+# --- Single-cell / matrix stack ---
+# numpy>=2.1 is required for Python 3.13 wheels (1.26.x only builds on <=3.12).
+numpy>=2.1,<3
+scipy>=1.14.1
+pandas>=2.2
+h5py>=3.12                      # .h5ad backend reader
+anndata>=0.11.3                 # AnnData container + read_h5ad
+
+# NOTE: scanpy was intentionally dropped. The engine only needs read_h5ad
+# (a re-export of anndata.read_h5ad). Avoiding scanpy also avoids the
+# numba/llvmlite build chain, which has no clean wheels on Python 3.13.
+# If you later add server-side clustering/UMAP, add `scanpy` back AND pin
+# numpy<2.2 to satisfy numba, or use Python 3.12.
+
+# --- AI agent ---
+google-genai>=1.9.0             # official Google GenAI SDK (function calling)
