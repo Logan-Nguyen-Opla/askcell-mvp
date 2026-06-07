@@ -88,6 +88,14 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class GenesRequest(BaseModel):
+    genes: list[str]
+
+
+class SelectionRequest(BaseModel):
+    cell_ids: list[int]
+
+
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
@@ -174,3 +182,43 @@ def chat(req: ChatRequest) -> dict:
         ) from exc
 
     return {"reply": reply}
+
+
+# --------------------------------------------------------------------------- #
+# Visualization endpoints (VIP-style features)
+# --------------------------------------------------------------------------- #
+def _require_loaded() -> None:
+    if not cell_engine_instance.is_loaded():
+        raise HTTPException(
+            status_code=400, detail="No dataset loaded. Upload an .h5ad first."
+        )
+
+
+@app.get("/api/gene/{gene}")
+def gene_per_cell(gene: str) -> dict:
+    """Per-cell expression vector for one gene (colors the embedding)."""
+    _require_loaded()
+    return cell_engine_instance.gene_per_cell(gene)
+
+
+@app.post("/api/expression/grouped")
+def grouped_expression(req: GenesRequest) -> dict:
+    """Per-cell-type mean / % expressing for the requested genes."""
+    _require_loaded()
+    if not req.genes:
+        raise HTTPException(status_code=400, detail="No genes requested.")
+    return cell_engine_instance.grouped_expression(req.genes)
+
+
+@app.post("/api/selection")
+def selection(req: SelectionRequest) -> dict:
+    """Summary stats for a set of selected cell ids (lasso/box select)."""
+    _require_loaded()
+    return cell_engine_instance.selection_stats(req.cell_ids)
+
+
+@app.get("/api/qc")
+def qc() -> dict:
+    """Numeric per-cell QC metrics for the right-panel histograms."""
+    _require_loaded()
+    return cell_engine_instance.qc_metrics()

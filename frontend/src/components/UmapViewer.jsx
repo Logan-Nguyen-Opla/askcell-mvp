@@ -2,53 +2,33 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import DeckGL from "@deck.gl/react";
 import { OrthographicView } from "@deck.gl/core";
 import { ScatterplotLayer } from "@deck.gl/layers";
+import { viridisRgb, viridisHex, norm, categoryRgb, categoryHex } from "../lib/viz.js";
 
 /**
  * UmapViewer
  * ----------
- * Hardware-accelerated 2D scatterplot of UMAP coordinates, colored by cell type.
+ * Hardware-accelerated 2D scatterplot of UMAP coordinates.
+ *
+ * Coloring has two modes (driven by the left controls panel):
+ *   - "celltype": categorical palette keyed on each cell's `c` index
+ *   - "gene":     continuous viridis ramp keyed on a per-cell expression value
+ *
+ * Also supports box-selection: in select mode, dragging draws a rectangle and
+ * the enclosed cells are reported via onSelect(ids) using deck's pickObjects.
  *
  * Props:
- *   cells: Array<{ id, x, y, c? }>   // c = index into `categories` (optional)
- *   categories: string[]            // e.g. ["B cells", "T cells", ...]
- *   labelField: string | null       // obs column used for coloring
+ *   cells: Array<{ id, x, y, c? }>
+ *   categories: string[]
+ *   labelField: string | null
+ *   colorMode: "celltype" | "gene"
+ *   geneValues: { gene, values:number[], vmin, vmax } | null
+ *   hidden: Set<number>          // hidden category indices (from the legend)
+ *   pointSize: number
+ *   selectMode: boolean
+ *   onSelect: (ids:number[]) => void
  */
 
-// Vibrant categorical palette tuned for the slate-950 background.
-const PALETTE = [
-  "#818cf8", // indigo
-  "#34d399", // emerald
-  "#fbbf24", // amber
-  "#fb7185", // rose
-  "#38bdf8", // sky
-  "#c084fc", // violet
-  "#fb923c", // orange
-  "#2dd4bf", // teal
-  "#f472b6", // pink
-  "#a3e635", // lime
-];
-const UNKNOWN_HEX = "#94a3b8"; // slate-400 for cells with no label
-const HIGHLIGHT = [255, 255, 255, 255]; // white hover highlight
-
-function hexToRgb(hex) {
-  const h = hex.replace("#", "");
-  return [
-    parseInt(h.slice(0, 2), 16),
-    parseInt(h.slice(2, 4), 16),
-    parseInt(h.slice(4, 6), 16),
-  ];
-}
-const PALETTE_RGB = PALETTE.map(hexToRgb);
-const UNKNOWN_RGB = hexToRgb(UNKNOWN_HEX);
-
-function colorFor(catIndex) {
-  if (catIndex == null || catIndex < 0) return UNKNOWN_RGB;
-  return PALETTE_RGB[catIndex % PALETTE_RGB.length];
-}
-function hexFor(catIndex) {
-  if (catIndex == null || catIndex < 0) return UNKNOWN_HEX;
-  return PALETTE[catIndex % PALETTE.length];
-}
+const HIGHLIGHT = [255, 255, 255, 255];
 
 function computeBounds(cells) {
   if (!cells || cells.length === 0) return null;
@@ -82,17 +62,28 @@ function fitViewState(bounds, width, height, padding = 0.9) {
   };
 }
 
-export default function UmapViewer({ cells, categories = [], labelField }) {
+export default function UmapViewer({
+  cells,
+  categories = [],
+  labelField,
+  colorMode = "celltype",
+  geneValues = null,
+  hidden,
+  pointSize = 4,
+  selectMode = false,
+  onSelect,
+}) {
   const containerRef = useRef(null);
+  const deckRef = useRef(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [viewState, setViewState] = useState(null);
-  const [pointSize, setPointSize] = useState(4);          // px radius
-  const [hidden, setHidden] = useState(() => new Set());  // hidden category indices
+  const [rect, setRect] = useState(null); // {x0,y0,x1,y1} during box drag
 
   const hasCategories = categories && categories.length > 0;
+  const geneMode = colorMode === "gene" && geneValues && geneValues.values;
   const bounds = useMemo(() => computeBounds(cells), [cells]);
+  const hiddenSet = hidden || EMPTY_SET;
 
-  // Track container pixel size (the left 70% pane).
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -104,17 +95,11 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
     return () => ro.disconnect();
   }, []);
 
-  // Re-fit when data or viewport changes.
   useEffect(() => {
     if (bounds && size.width && size.height) {
       setViewState(fitViewState(bounds, size.width, size.height));
     }
   }, [bounds, size.width, size.height]);
-
-  // Reset hidden set whenever the dataset changes.
-  useEffect(() => {
-    setHidden(new Set());
-  }, [categories]);
 
   const resetView = useCallback(() => {
     if (bounds && size.width && size.height) {
@@ -122,11 +107,21 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
     }
   }, [bounds, size.width, size.height]);
 
-  // Visible subset (after legend toggles).
   const visibleCells = useMemo(() => {
-    if (!hasCategories || hidden.size === 0) return cells;
-    return cells.filter((d) => !hidden.has(d.c));
-  }, [cells, hidden, hasCategories]);
+    if (!hasCategories || hiddenSet.size === 0) return cells;
+    return cells.filter((d) => !hiddenSet.has(d.c));
+  }, [cells, hiddenSet, hasCategories]);
+
+  const getFillColor = useCallback(
+    (d) => {
+      if (geneMode) {
+        const v = geneValues.values[d.id];
+        return viridisRgb(norm(v, geneValues.vmin, geneValues.vmax));
+      }
+      return categoryRgb(d.c);
+    },
+    [geneMode, geneValues]
+  );
 
   const layers = useMemo(
     () => [
@@ -134,43 +129,101 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
         id: "umap-cells",
         data: visibleCells,
         getPosition: (d) => [d.x, d.y],
-        getFillColor: (d) => colorFor(d.c),
+        getFillColor,
+        // Fixed on-screen size: radius is in screen pixels and the min/max
+        // clamps are locked to pointSize, so points NEVER grow or shrink when
+        // zooming — only their spacing changes.
         getRadius: pointSize,
         radiusUnits: "pixels",
-        radiusMinPixels: 1,
-        radiusMaxPixels: 24,
+        radiusMinPixels: pointSize,
+        radiusMaxPixels: pointSize,
         stroked: false,
         filled: true,
         antialiasing: true,
         pickable: true,
-        autoHighlight: true,
+        autoHighlight: !selectMode,
         highlightColor: HIGHLIGHT,
         opacity: 0.9,
         updateTriggers: {
           getRadius: pointSize,
-          getFillColor: [hasCategories],
+          getFillColor: [geneMode, geneValues && geneValues.gene],
         },
       }),
     ],
-    [visibleCells, pointSize, hasCategories]
+    [visibleCells, pointSize, selectMode, getFillColor, geneMode, geneValues]
   );
 
-  const toggleCategory = useCallback((idx) => {
-    setHidden((prev) => {
-      const next = new Set(prev);
-      if (next.has(idx)) next.delete(idx);
-      else next.add(idx);
-      return next;
-    });
-  }, []);
+  // ---- Box selection (only active in select mode) ----
+  const onMouseDown = useCallback(
+    (e) => {
+      if (!selectMode) return;
+      const r = containerRef.current.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const y = e.clientY - r.top;
+      setRect({ x0: x, y0: y, x1: x, y1: y });
+    },
+    [selectMode]
+  );
+
+  const onMouseMove = useCallback(
+    (e) => {
+      if (!selectMode || !rect) return;
+      const r = containerRef.current.getBoundingClientRect();
+      setRect((prev) => ({
+        ...prev,
+        x1: e.clientX - r.left,
+        y1: e.clientY - r.top,
+      }));
+    },
+    [selectMode, rect]
+  );
+
+  const onMouseUp = useCallback(() => {
+    if (!selectMode || !rect) return;
+    const x = Math.min(rect.x0, rect.x1);
+    const y = Math.min(rect.y0, rect.y1);
+    const width = Math.abs(rect.x1 - rect.x0);
+    const height = Math.abs(rect.y1 - rect.y0);
+    setRect(null);
+    if (width < 3 || height < 3) {
+      onSelect?.([]); // treated as a click-to-clear
+      return;
+    }
+    const deck = deckRef.current;
+    if (deck && deck.pickObjects) {
+      const picked = deck.pickObjects({ x, y, width, height });
+      const ids = [];
+      const seen = new Set();
+      for (const p of picked) {
+        const id = p.object?.id;
+        if (id != null && !seen.has(id)) {
+          seen.add(id);
+          ids.push(id);
+        }
+      }
+      onSelect?.(ids);
+    }
+  }, [selectMode, rect, onSelect]);
 
   return (
-    <div ref={containerRef} className="relative h-full w-full bg-slate-950">
+    <div
+      ref={containerRef}
+      className="relative h-full w-full bg-slate-950"
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      style={{ cursor: selectMode ? "crosshair" : "default" }}
+    >
       {viewState && (
         <DeckGL
+          ref={deckRef}
           views={new OrthographicView({ id: "ortho", flipY: false })}
           viewState={viewState}
-          controller={{ scrollZoom: true, dragPan: true, doubleClickZoom: true }}
+          controller={{
+            scrollZoom: true,
+            dragPan: !selectMode,
+            doubleClickZoom: true,
+          }}
           onViewStateChange={({ viewState: vs }) => setViewState(vs)}
           layers={layers}
           getTooltip={({ object }) =>
@@ -178,7 +231,12 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
               html: `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.5">
                        ${
                          object.c != null && categories[object.c]
-                           ? `<span style="color:${hexFor(object.c)}">●</span> <b>${categories[object.c]}</b><br/>`
+                           ? `<span style="color:${categoryHex(object.c)}">●</span> <b>${categories[object.c]}</b><br/>`
+                           : ""
+                       }
+                       ${
+                         geneMode
+                           ? `<b>${geneValues.gene}</b>: ${(geneValues.values[object.id] ?? 0).toFixed(3)}<br/>`
                            : ""
                        }
                        cell #${object.id}<br/>
@@ -196,58 +254,48 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
         />
       )}
 
-      {/* Legend (top-right) — click an item to show/hide that type */}
-      {hasCategories && (
-        <div className="absolute right-4 top-4 max-h-[60%] w-48 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/80 p-3 backdrop-blur askcell-scroll">
-          <div className="mb-2 font-mono text-[10px] uppercase tracking-widest text-slate-500">
-            {labelField || "cell type"}
+      {/* Box-selection rectangle */}
+      {rect && (
+        <div
+          className="pointer-events-none absolute border border-emerald-400/80 bg-emerald-400/10"
+          style={{
+            left: Math.min(rect.x0, rect.x1),
+            top: Math.min(rect.y0, rect.y1),
+            width: Math.abs(rect.x1 - rect.x0),
+            height: Math.abs(rect.y1 - rect.y0),
+          }}
+        />
+      )}
+
+      {/* Continuous color bar (gene mode) */}
+      {geneMode && (
+        <div className="absolute right-4 top-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3 backdrop-blur">
+          <div className="mb-1.5 font-mono text-[11px] text-slate-200">
+            {geneValues.gene}
           </div>
-          <div className="space-y-1">
-            {categories.map((name, i) => {
-              const isHidden = hidden.has(i);
-              return (
-                <button
-                  key={name}
-                  onClick={() => toggleCategory(i)}
-                  className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs transition hover:bg-slate-800/60 ${
-                    isHidden ? "opacity-35" : "opacity-100"
-                  }`}
-                >
-                  <span
-                    className="h-2.5 w-2.5 shrink-0 rounded-full"
-                    style={{ backgroundColor: hexFor(i) }}
-                  />
-                  <span className="truncate text-slate-200">{name}</span>
-                </button>
-              );
-            })}
+          <div
+            className="h-2.5 w-40 rounded"
+            style={{
+              background: `linear-gradient(to right, ${viridisHex(0)}, ${viridisHex(
+                0.25
+              )}, ${viridisHex(0.5)}, ${viridisHex(0.75)}, ${viridisHex(1)})`,
+            }}
+          />
+          <div className="mt-1 flex w-40 justify-between font-mono text-[9px] text-slate-500">
+            <span>{geneValues.vmin}</span>
+            <span>expression</span>
+            <span>{geneValues.vmax}</span>
           </div>
         </div>
       )}
 
-      {/* Point-size slider (bottom-center) */}
-      <div className="pointer-events-auto absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/80 px-4 py-2 backdrop-blur">
-        <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-          size
-        </span>
-        <input
-          type="range"
-          min="1"
-          max="12"
-          step="0.5"
-          value={pointSize}
-          onChange={(e) => setPointSize(parseFloat(e.target.value))}
-          className="h-1 w-40 cursor-pointer accent-indigo-500"
-        />
-        <span className="w-6 text-center font-mono text-xs text-indigo-300">
-          {pointSize}
-        </span>
-      </div>
-
       {/* Cell counter (bottom-left) */}
       <div className="pointer-events-none absolute bottom-4 left-4 rounded-lg border border-slate-800 bg-slate-900/80 px-3 py-1.5 font-mono text-xs text-indigo-300 backdrop-blur">
         {visibleCells.length.toLocaleString()}
-        {hidden.size > 0 ? ` / ${cells.length.toLocaleString()}` : ""} cells
+        {hiddenSet.size > 0 ? ` / ${cells.length.toLocaleString()}` : ""} cells
+        {selectMode && (
+          <span className="ml-2 text-emerald-300">· drag to select</span>
+        )}
       </div>
 
       {/* Reset view (bottom-right) */}
@@ -260,3 +308,5 @@ export default function UmapViewer({ cells, categories = [], labelField }) {
     </div>
   );
 }
+
+const EMPTY_SET = new Set();
