@@ -80,6 +80,8 @@ export default function ChatSidebar({ datasetReady }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef(null);
+  const textareaRef = useRef(null);
+  const MAX_INPUT_HEIGHT = 200; // px — grow with input up to here, then scroll
 
   // Auto-scroll to the latest entry.
   useEffect(() => {
@@ -88,6 +90,14 @@ export default function ChatSidebar({ datasetReady }) {
       behavior: "smooth",
     });
   }, [messages, loading]);
+
+  // Auto-grow the composer to fit what the user types (capped, then scrolls).
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, MAX_INPUT_HEIGHT)}px`;
+  }, [input]);
 
   async function sendMessage(text) {
     const trimmed = text.trim();
@@ -181,6 +191,7 @@ export default function ChatSidebar({ datasetReady }) {
       <div className="border-t border-slate-800 p-4">
         <div className="flex items-end gap-2 rounded-xl border border-slate-800 bg-slate-950 p-2 focus-within:border-indigo-500/60">
           <textarea
+            ref={textareaRef}
             rows={1}
             value={input}
             disabled={loading || !datasetReady}
@@ -189,7 +200,8 @@ export default function ChatSidebar({ datasetReady }) {
             placeholder={
               datasetReady ? "Ask about a gene…" : "Load a dataset first…"
             }
-            className="max-h-28 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm text-slate-100 placeholder:text-slate-600 focus:outline-none disabled:cursor-not-allowed"
+            style={{ maxHeight: MAX_INPUT_HEIGHT }}
+            className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-slate-100 placeholder:text-slate-600 focus:outline-none disabled:cursor-not-allowed askcell-scroll"
           />
           <button
             onClick={() => sendMessage(input)}

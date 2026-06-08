@@ -355,7 +355,7 @@ export default function App() {
       </div>
 
       {/* ---------------- Right rail: selection + Chat/QC ---------------- */}
-      <div className="flex h-full w-80 shrink-0 flex-col border-l border-slate-800">
+      <div className="flex h-full w-96 shrink-0 flex-col border-l border-slate-800">
         {selection && (
           <SelectionCard selection={selection} onClear={() => setSelection(null)} />
         )}
