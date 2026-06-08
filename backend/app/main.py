@@ -114,6 +114,9 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict:
         )
 
     # Stream the upload to a temp file, then hand the path to the engine.
+    # The engine takes ownership (owns_file=True): it deletes the temp itself
+    # once loaded in-memory, or keeps it alive for backed (big-file) mode. We
+    # only clean up here if load() fails before taking ownership.
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -122,19 +125,21 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
-        cell_engine_instance.load(tmp_path, file.filename)
+        cell_engine_instance.load(tmp_path, file.filename, owns_file=True)
 
     except ValueError as exc:
         # Validation failure (e.g. missing UMAP) -> 422.
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         raise HTTPException(
             status_code=500, detail=f"Failed to process file: {exc}"
         ) from exc
     finally:
         await file.close()
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
     return {"message": "File processed successfully", "filename": file.filename}
 

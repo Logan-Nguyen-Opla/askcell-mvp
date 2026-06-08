@@ -426,7 +426,11 @@ function SelectionCard({ selection, onClear }) {
               <span
                 key={g.gene}
                 className="rounded bg-slate-800/70 px-1.5 py-0.5 font-mono text-[10px] text-emerald-200"
-                title={`mean ${g.mean} · +${g.enrichment} vs all`}
+                title={
+                  g.enrichment != null
+                    ? `mean ${g.mean} · +${g.enrichment} vs all`
+                    : `mean ${g.mean}`
+                }
               >
                 {g.gene}
               </span>

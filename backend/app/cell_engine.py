@@ -21,6 +21,8 @@ explicitly cast to a standard Python primitive via ``float()`` / ``int()``.
 
 from __future__ import annotations
 
+import os
+
 import anndata as ad
 import numpy as np
 import pandas as pd
@@ -34,6 +36,26 @@ _PREFERRED_LABELS = [
     "leiden", "louvain", "clusters", "cluster", "seurat_clusters",
 ]
 
+# Files larger than this are opened in "backed" mode: the expression matrix
+# stays on disk (read lazily) instead of being loaded fully into RAM, so a big
+# dataset fits in a 512 MB container. Smaller files load fully in-memory for
+# speed + full feature support (e.g. global enrichment in selection stats).
+_BACKED_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+# Hard cap on how many cells are streamed to the browser. Beyond this we send a
+# deterministic random subsample so the scatter payload + WebGL stay snappy.
+# Stats/queries still resolve against the full dataset on the server.
+_DISPLAY_CAP = 150_000
+
+
+def _silent_remove(path: str) -> None:
+    """Best-effort delete of a temp file; never raise."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 class CellEngine:
     """In-memory holder + analytics for a single scRNA-seq dataset."""
@@ -41,21 +63,33 @@ class CellEngine:
     def __init__(self) -> None:
         self.adata = None          # type: ignore[assignment]  # anndata.AnnData
         self.filename: str | None = None
+        self._backed = False
+        self._owned_tmp: str | None = None  # temp upload we must delete on swap
+        self._display_idx: np.ndarray | None = None  # subsample, or None = all
 
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
-    def load(self, file_path: str, filename: str) -> None:
-        """Read an .h5ad file into memory and validate it.
+    def load(self, file_path: str, filename: str, owns_file: bool = False) -> None:
+        """Read an .h5ad file and validate it.
+
+        Big files (> threshold) open in backed mode so the matrix stays on
+        disk. When ``owns_file`` is set, the engine takes responsibility for
+        deleting ``file_path`` — immediately if loaded in-memory, or on the next
+        swap/reset if it's held open in backed mode.
 
         Raises
         ------
         ValueError
             If the dataset does not contain pre-computed UMAP coordinates.
+            (On failure the engine does NOT take ownership of ``file_path``.)
         """
-        adata = ad.read_h5ad(file_path)
+        backed = os.path.getsize(file_path) > _BACKED_THRESHOLD_BYTES
+        adata = ad.read_h5ad(file_path, backed="r" if backed else None)
 
         if "X_umap" not in adata.obsm:
+            if adata.isbacked:
+                adata.file.close()
             raise ValueError(
                 "Dataset is missing pre-computed UMAP coordinates "
                 "(expected adata.obsm['X_umap']). Please run sc.tl.umap "
@@ -65,15 +99,56 @@ class CellEngine:
         # Make gene lookups O(1) and case-insensitive friendly downstream.
         adata.var_names_make_unique()
 
+        # Success — release the previous dataset, then install this one.
+        self._release()
         self.adata = adata
         self.filename = filename
+        self._backed = backed
+        if owns_file and not backed:
+            # Data is fully in RAM; the temp file is no longer needed.
+            _silent_remove(file_path)
+            self._owned_tmp = None
+        else:
+            self._owned_tmp = file_path if owns_file else None
+        self._compute_display_index()
 
     def is_loaded(self) -> bool:
         return self.adata is not None
 
     def reset(self) -> None:
+        self._release()
         self.adata = None
         self.filename = None
+        self._backed = False
+        self._display_idx = None
+
+    def _release(self) -> None:
+        """Close any backed file handle and delete the owned temp upload."""
+        if self.adata is not None and getattr(self.adata, "isbacked", False):
+            try:
+                self.adata.file.close()
+            except Exception:
+                pass
+        if self._owned_tmp:
+            _silent_remove(self._owned_tmp)
+            self._owned_tmp = None
+
+    def _compute_display_index(self) -> None:
+        """Pick a stable subsample of cell indices when the dataset is huge."""
+        n = int(self.adata.n_obs)
+        if n > _DISPLAY_CAP:
+            rng = np.random.default_rng(0)  # deterministic across requests
+            self._display_idx = np.sort(
+                rng.choice(n, size=_DISPLAY_CAP, replace=False)
+            )
+        else:
+            self._display_idx = None
+
+    def _display_indices(self) -> np.ndarray:
+        """Original-index array of the cells we expose to the front-end."""
+        if self._display_idx is not None:
+            return self._display_idx
+        return np.arange(int(self.adata.n_obs))
 
     # ------------------------------------------------------------------ #
     # UMAP coordinates
@@ -100,8 +175,12 @@ class CellEngine:
             categories = [str(c) for c in series.cat.categories]
             codes = series.cat.codes.to_numpy()  # int per cell; -1 = missing
 
+        # Only emit the displayed subset; `id` is the ORIGINAL cell index so
+        # selection + gene lookups keep resolving against the full dataset.
+        idx = self._display_indices()
         cells = []
-        for i in range(n):
+        for i in idx:
+            i = int(i)
             cell = {"id": i, "x": float(xs[i]), "y": float(ys[i])}
             if codes is not None:
                 cell["c"] = int(codes[i])  # index into `categories` (-1 if unknown)
@@ -109,6 +188,8 @@ class CellEngine:
 
         return {
             "total_cells": n,
+            "displayed_cells": len(cells),
+            "subsampled": self._display_idx is not None,
             "label_field": label_field,
             "categories": categories,
             "cells": cells,
@@ -233,11 +314,16 @@ class CellEngine:
             }
 
         expr = self._expr_vector(gene)
+        idx = self._display_indices()
+        shown = expr[idx]
+        # Keyed by original cell id so the front-end's values[d.id] still works
+        # even when only a subsample of cells is displayed.
+        values = {int(i): round(float(expr[i]), 4) for i in idx}
         return {
             "gene": gene,
-            "values": [round(float(v), 4) for v in expr],
-            "vmin": round(float(expr.min()), 4) if expr.size else 0.0,
-            "vmax": round(float(expr.max()), 4) if expr.size else 0.0,
+            "values": values,
+            "vmin": round(float(shown.min()), 4) if shown.size else 0.0,
+            "vmax": round(float(shown.max()), 4) if shown.size else 0.0,
         }
 
     def grouped_expression(self, genes: list[str]) -> dict:
@@ -312,31 +398,40 @@ class CellEngine:
                 key=lambda d: -d["count"],
             )
 
-        # Enriched genes: selection mean minus global mean, per gene.
-        X = self.adata.X
-        sub = X[ids]
+        # Mean expression within the selection (loads only the selected rows).
+        sub = self.adata[ids].X
         sel_mean = (
             np.asarray(sub.mean(axis=0)).ravel()
             if sparse.issparse(sub)
             else np.asarray(sub).mean(axis=0).ravel()
         )
-        glob_mean = (
-            np.asarray(X.mean(axis=0)).ravel()
-            if sparse.issparse(X)
-            else np.asarray(X).mean(axis=0).ravel()
-        )
-        diff = sel_mean - glob_mean
-        order = np.argsort(-diff)[:top_n]
+
+        # Enrichment vs the whole dataset is only cheap when X is in memory;
+        # for a disk-backed matrix, rank by in-selection mean instead.
+        if not self._backed:
+            X = self.adata.X
+            glob_mean = (
+                np.asarray(X.mean(axis=0)).ravel()
+                if sparse.issparse(X)
+                else np.asarray(X).mean(axis=0).ravel()
+            )
+            score = sel_mean - glob_mean
+            include_enrichment = True
+        else:
+            score = sel_mean
+            include_enrichment = False
+
+        order = np.argsort(-score)[:top_n]
         var_names = self.adata.var_names
-        out["top_genes"] = [
-            {
-                "gene": str(var_names[i]),
-                "mean": round(float(sel_mean[i]), 4),
-                "enrichment": round(float(diff[i]), 4),
-            }
-            for i in order
-            if sel_mean[i] > 0
-        ]
+        top = []
+        for i in order:
+            if sel_mean[i] <= 0:
+                continue
+            entry = {"gene": str(var_names[i]), "mean": round(float(sel_mean[i]), 4)}
+            if include_enrichment:
+                entry["enrichment"] = round(float(score[i]), 4)
+            top.append(entry)
+        out["top_genes"] = top
         return out
 
     def qc_metrics(self, max_metrics: int = 6) -> dict:
@@ -349,6 +444,7 @@ class CellEngine:
         self._assert_loaded()
 
         obs = self.adata.obs
+        idx = self._display_indices()
         metrics = []
         for col in obs.columns:
             if len(metrics) >= max_metrics:
@@ -356,7 +452,7 @@ class CellEngine:
             s = obs[col]
             if str(s.dtype) == "category" or not pd.api.types.is_numeric_dtype(s):
                 continue
-            vals = s.to_numpy(dtype=float)
+            vals = s.to_numpy(dtype=float)[idx]  # subsample for the histogram
             if not np.any(np.isfinite(vals)):
                 continue
             metrics.append(
@@ -381,8 +477,12 @@ class CellEngine:
         return lower_map.get(gene.lower())
 
     def _expr_vector(self, gene: str) -> np.ndarray:
-        """Dense 1-D expression vector for a resolved gene (cell-ordered)."""
-        column = self.adata.X[:, self.adata.var_names.get_loc(gene)]
+        """Dense 1-D expression vector for a resolved gene (cell-ordered).
+
+        Uses label-based subsetting (``adata[:, gene].X``) so it works whether
+        the matrix is in memory or read lazily from a backed file.
+        """
+        column = self.adata[:, gene].X
         if sparse.issparse(column):
             return column.toarray().ravel()
         return np.asarray(column).ravel()
