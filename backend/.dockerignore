@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+*.h5ad
+!sample_data/mock_pbmc.h5ad

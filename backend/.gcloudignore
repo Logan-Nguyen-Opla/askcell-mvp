@@ -1,0 +1,14 @@
+# Files NOT uploaded to Cloud Build when deploying from source.
+# (Without this, gcloud would upload .venv and .env — huge and a secret leak.)
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Never ship the local secrets file.
+.env
+
+# Exclude any uploaded datasets, but KEEP the bundled sample.
+*.h5ad
+!sample_data/mock_pbmc.h5ad
