@@ -116,6 +116,21 @@ requirement: it must already contain 2D UMAP coordinates in
 datasets like `pbmc3k` have this. A raw count matrix does not — run it through
 the standard UMAP step first (e.g. in scanpy on Python 3.12 or Google Colab).
 
+### Large files
+
+Uploads are bottlenecked by your **internet upload speed** — a 2 GB file can
+take ~20 minutes to send before parsing even starts. The viewer only displays
+up to 150k cells, so for huge datasets it's far faster to **downsample first**:
+
+```bash
+cd backend
+.venv/Scripts/python downsample_h5ad.py /path/to/big.h5ad
+# -> writes big.subsampled.h5ad (100k cells) — upload that instead
+```
+
+Pass a custom output name / cell count: `python downsample_h5ad.py big.h5ad out.h5ad 150000`.
+The app also warns you before a large upload and shows a live progress bar + ETA.
+
 ---
 
 ## API reference

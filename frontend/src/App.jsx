@@ -20,6 +20,23 @@ import QcHistograms from "./components/QcHistograms.jsx";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+// Files bigger than this trigger a "this will take a while" confirmation.
+const BIG_FILE_BYTES = 200 * 1024 * 1024; // 200 MB
+// Rough upstream assumption for the *pre-upload* estimate (~16 Mbps). The live
+// ETA during upload uses the real measured rate.
+const EST_UPLOAD_BPS = 2 * 1024 * 1024;
+
+function formatBytes(b) {
+  if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(1) + " GB";
+  return Math.round(b / (1024 * 1024)) + " MB";
+}
+function formatDuration(sec) {
+  if (sec < 60) return Math.ceil(sec) + "s";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+
 export default function App() {
   // dataset
   const [cells, setCells] = useState([]);
@@ -29,6 +46,12 @@ export default function App() {
   const [filename, setFilename] = useState(null);
   const [error, setError] = useState(null);
   const [dragging, setDragging] = useState(false);
+
+  // upload progress
+  const [uploadPct, setUploadPct] = useState(null); // 0-100 while sending
+  const [uploadEta, setUploadEta] = useState(null);
+  const [uploadPhase, setUploadPhase] = useState(null); // "sending" | "processing"
+  const [pendingFile, setPendingFile] = useState(null); // big file awaiting confirm
 
   // coloring / genes
   const [colorMode, setColorMode] = useState("celltype");
@@ -90,45 +113,104 @@ export default function App() {
     };
   }, []);
 
+  // Actual upload via XHR so we can show real upload progress + a live ETA.
+  const doUpload = useCallback(
+    (file) => {
+      setStatus("uploading");
+      setError(null);
+      resetAnalysis();
+      setUploadPct(0);
+      setUploadPhase("sending");
+      setUploadEta(null);
+
+      const form = new FormData();
+      form.append("file", file);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_URL}/api/upload`);
+      const startedAt = performance.now();
+
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = (e.loaded / e.total) * 100;
+        setUploadPct(pct);
+        const elapsed = (performance.now() - startedAt) / 1000;
+        const rate = e.loaded / Math.max(elapsed, 0.001);
+        const remain = (e.total - e.loaded) / Math.max(rate, 1);
+        setUploadEta(remain > 1 ? formatDuration(remain) : null);
+        if (pct >= 99.9) setUploadPhase("processing"); // server parsing now
+      };
+
+      xhr.onload = async () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setUploadPhase("processing");
+          setUploadEta(null);
+          try {
+            const upData = JSON.parse(xhr.responseText || "{}");
+            const umapRes = await fetch(`${API_URL}/api/umap`);
+            if (!umapRes.ok) {
+              const err = await umapRes.json().catch(() => ({}));
+              throw new Error(err.detail || `UMAP fetch failed (${umapRes.status})`);
+            }
+            const umapData = await umapRes.json();
+            setCells(umapData.cells);
+            setCategories(umapData.categories || []);
+            setLabelField(umapData.label_field || null);
+            setFilename(upData.filename || file.name);
+            setStatus("ready");
+          } catch (e) {
+            setStatus("error");
+            setError(e.message);
+          }
+        } else {
+          let detail = `Upload failed (${xhr.status})`;
+          try {
+            detail = JSON.parse(xhr.responseText).detail || detail;
+          } catch {
+            /* non-JSON error body */
+          }
+          setStatus("error");
+          setError(detail);
+        }
+        setUploadPct(null);
+        setUploadPhase(null);
+      };
+
+      xhr.onerror = () => {
+        setStatus("error");
+        setError(
+          "Upload failed — network dropped or the file exceeded the server limit."
+        );
+        setUploadPct(null);
+        setUploadPhase(null);
+      };
+
+      xhr.send(form);
+    },
+    [resetAnalysis]
+  );
+
   const handleFile = useCallback(
-    async (file) => {
+    (file) => {
       if (!file) return;
       if (!file.name.endsWith(".h5ad")) {
         setStatus("error");
         setError("Please upload an .h5ad file");
         return;
       }
-      setStatus("uploading");
-      setError(null);
-      resetAnalysis();
-      try {
-        const form = new FormData();
-        form.append("file", file);
-        const upRes = await fetch(`${API_URL}/api/upload`, { method: "POST", body: form });
-        if (!upRes.ok) {
-          const err = await upRes.json().catch(() => ({}));
-          throw new Error(err.detail || `Upload failed (${upRes.status})`);
-        }
-        const upData = await upRes.json();
-
-        const umapRes = await fetch(`${API_URL}/api/umap`);
-        if (!umapRes.ok) {
-          const err = await umapRes.json().catch(() => ({}));
-          throw new Error(err.detail || `UMAP fetch failed (${umapRes.status})`);
-        }
-        const umapData = await umapRes.json();
-        setCells(umapData.cells);
-        setCategories(umapData.categories || []);
-        setLabelField(umapData.label_field || null);
-        setFilename(upData.filename);
-        setStatus("ready");
-      } catch (e) {
-        setStatus("error");
-        setError(e.message);
+      if (file.size > BIG_FILE_BYTES) {
+        setPendingFile(file); // ask before committing to a long upload
+        return;
       }
+      doUpload(file);
     },
-    [resetAnalysis]
+    [doUpload]
   );
+
+  const confirmPending = useCallback(() => {
+    const f = pendingFile;
+    setPendingFile(null);
+    if (f) doUpload(f);
+  }, [pendingFile, doUpload]);
 
   // ---- Gene handling ----
   const fetchGene = useCallback(
@@ -327,7 +409,21 @@ export default function App() {
               onSelect={onSelect}
             />
           ) : (
-            <EmptyState status={status} error={error} />
+            <EmptyState
+              status={status}
+              error={error}
+              uploadPct={uploadPct}
+              uploadPhase={uploadPhase}
+              uploadEta={uploadEta}
+            />
+          )}
+
+          {pendingFile && (
+            <BigFilePrompt
+              file={pendingFile}
+              onConfirm={confirmPending}
+              onCancel={() => setPendingFile(null)}
+            />
           )}
 
           {dragging && (
@@ -442,7 +538,9 @@ function SelectionCard({ selection, onClear }) {
   );
 }
 
-function EmptyState({ status, error }) {
+function EmptyState({ status, error, uploadPct, uploadPhase, uploadEta }) {
+  const uploading = status === "uploading";
+
   return (
     <div className="flex h-full w-full flex-col items-center justify-center bg-slate-950">
       <div className="mb-5 grid grid-cols-6 gap-1.5 opacity-30">
@@ -454,14 +552,89 @@ function EmptyState({ status, error }) {
           />
         ))}
       </div>
-      <h3 className="text-lg font-medium text-slate-300">
-        {status === "uploading" ? "Processing dataset…" : "Drop an .h5ad file to begin"}
-      </h3>
-      <p className="mt-2 max-w-sm text-center text-sm text-slate-500">
-        {status === "error"
-          ? error
-          : "Upload a single-cell RNA-seq dataset with pre-computed UMAP coordinates to explore it in real time."}
-      </p>
+
+      {uploading ? (
+        <div className="w-80 max-w-[80%] text-center">
+          <h3 className="mb-3 text-lg font-medium text-slate-300">
+            {uploadPhase === "processing"
+              ? "Processing on server…"
+              : "Uploading…"}
+          </h3>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+            <div
+              className="h-full rounded-full bg-indigo-500 transition-[width] duration-200"
+              style={{
+                width:
+                  uploadPhase === "processing"
+                    ? "100%"
+                    : `${Math.max(2, uploadPct || 0)}%`,
+              }}
+            />
+          </div>
+          <div className="mt-2 font-mono text-xs text-slate-500">
+            {uploadPhase === "processing"
+              ? "parsing the dataset — almost there"
+              : `${Math.round(uploadPct || 0)}% uploaded${
+                  uploadEta ? ` · ~${uploadEta} left` : ""
+                }`}
+          </div>
+        </div>
+      ) : (
+        <>
+          <h3 className="text-lg font-medium text-slate-300">
+            Drop an .h5ad file to begin
+          </h3>
+          <p className="mt-2 max-w-sm text-center text-sm text-slate-500">
+            {status === "error"
+              ? error
+              : "Upload a single-cell RNA-seq dataset with pre-computed UMAP coordinates to explore it in real time."}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function BigFilePrompt({ file, onConfirm, onCancel }) {
+  const estSec = file.size / EST_UPLOAD_BPS;
+  return (
+    <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/85 backdrop-blur-sm">
+      <div className="w-[26rem] max-w-[88%] rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-xl">
+        <h3 className="mb-1 text-base font-semibold text-slate-100">
+          Large file — heads up
+        </h3>
+        <p className="text-sm leading-relaxed text-slate-400">
+          <span className="font-mono text-slate-200">{file.name}</span> is{" "}
+          <span className="font-semibold text-amber-300">
+            {formatBytes(file.size)}
+          </span>
+          . Uploading the whole thing will take roughly{" "}
+          <span className="font-semibold text-amber-300">
+            ~{formatDuration(estSec)}
+          </span>{" "}
+          on a typical connection (could be longer on slower upload speeds).
+        </p>
+        <p className="mt-3 text-xs leading-relaxed text-slate-500">
+          The viewer only displays up to 150k cells anyway. For a much faster
+          experience you can shrink it first with{" "}
+          <span className="font-mono text-slate-400">downsample_h5ad.py</span>{" "}
+          (see the README), then upload the smaller file.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-300 transition hover:bg-slate-800"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-sm font-medium text-white transition hover:bg-indigo-500"
+          >
+            Upload full file (~{formatDuration(estSec)})
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
