@@ -137,7 +137,7 @@ export default function ChatSidebar({ datasetReady }) {
           AskCell AI
         </h2>
         <span className="ml-auto font-mono text-[10px] uppercase tracking-widest text-slate-500">
-          gemini-2.5-flash
+          claude-haiku-4-5
         </span>
       </div>
 

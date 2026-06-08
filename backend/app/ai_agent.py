@@ -1,36 +1,41 @@
 """
 ai_agent.py
 ===========
-Gemini Live client + tool specifications for AskCell.
+Anthropic Claude client + tool specifications for AskCell.
 
 This layer wires the deterministic ``get_gene_expression`` tool from the
-``cell_engine`` into Google's Gemini model using the official ``google-genai``
-SDK. We run the function-calling loop *manually* (automatic function calling is
-disabled) so the flow is explicit and auditable:
+``cell_engine`` into Anthropic's Claude models using the official ``anthropic``
+SDK. We run the tool-use (function-calling) loop *manually* so the flow is
+explicit and auditable:
 
     user message
-        -> Gemini decides to call get_gene_expression(gene_name=...)
+        -> Claude decides to call get_gene_expression(gene_name=...)
         -> we intercept the call and execute real Python against the matrix
-        -> we feed the exact numbers back to Gemini
-        -> Gemini synthesizes a scientific natural-language answer
+        -> we feed the exact numbers back to Claude as a tool_result
+        -> Claude synthesizes a scientific natural-language answer
 
 The model is forbidden (via system prompt) from inventing biological metrics;
 all numbers come from the in-memory dataset.
+
+(Originally built on Google Gemini; migrated to Anthropic Claude.)
 """
 
 from __future__ import annotations
 
+import json
 import os
 
-from google import genai
-from google.genai import types
+import anthropic
 
 from .cell_engine import cell_engine_instance
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-MODEL = "gemini-2.5-flash"  # ultra-low latency, strong structured/tool output
+# Haiku 4.5 — fast and cost-effective, ample for this single-tool Q&A agent.
+# Swap to "claude-sonnet-4-6" or "claude-opus-4-8" for higher reasoning depth.
+MODEL = "claude-haiku-4-5"
+MAX_TOKENS = 1024
 
 SYSTEM_PROMPT = (
     "You are AskCell AI, an elite Molecular Biologist and Bioinformatics "
@@ -77,33 +82,35 @@ def _dataset_context() -> str:
         "get_gene_expression for gene-level numbers."
     )
 
+
 # --------------------------------------------------------------------------- #
 # Tool declaration (mapped 1:1 to cell_engine.get_gene_expression)
 # --------------------------------------------------------------------------- #
-GET_GENE_EXPRESSION_DECLARATION = types.FunctionDeclaration(
-    name="get_gene_expression",
-    description=(
-        "Query the currently loaded single-cell RNA-seq dataset for the "
-        "expression statistics of a single gene. Returns the mean expression, "
-        "maximum expression, and the percentage of cells expressing the gene. "
-        "Use this for any question about how strongly or how widely a gene is "
-        "expressed in the sample."
-    ),
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "gene_name": types.Schema(
-                type=types.Type.STRING,
-                description=(
-                    "The gene symbol to look up, e.g. 'CD3D', 'PDCD1', 'MS4A1'."
-                ),
-            ),
+TOOLS = [
+    {
+        "name": "get_gene_expression",
+        "description": (
+            "Query the currently loaded single-cell RNA-seq dataset for the "
+            "expression statistics of a single gene. Returns the mean "
+            "expression, maximum expression, and the percentage of cells "
+            "expressing the gene. Call this for any question about how strongly "
+            "or how widely a gene is expressed in the sample."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "gene_name": {
+                    "type": "string",
+                    "description": (
+                        "The gene symbol to look up, e.g. 'CD3D', 'PDCD1', "
+                        "'MS4A1'."
+                    ),
+                }
+            },
+            "required": ["gene_name"],
         },
-        required=["gene_name"],
-    ),
-)
-
-TOOLS = types.Tool(function_declarations=[GET_GENE_EXPRESSION_DECLARATION])
+    }
+]
 
 # Local dispatch table: tool name -> python callable.
 TOOL_REGISTRY = {
@@ -112,95 +119,91 @@ TOOL_REGISTRY = {
     ),
 }
 
-_MAX_TOOL_ROUNDS = 5  # safety bound on the function-calling loop
+_MAX_TOOL_ROUNDS = 5  # safety bound on the tool-use loop
 
 
 # --------------------------------------------------------------------------- #
 # Client (lazy singleton so import never fails when the key is absent)
 # --------------------------------------------------------------------------- #
-_client: genai.Client | None = None
+_client: anthropic.Anthropic | None = None
 
 
-def _get_client() -> genai.Client:
+def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is not set. Add it to backend/.env "
+                "ANTHROPIC_API_KEY is not set. Add it to backend/.env "
                 "(see .env.example)."
             )
-        _client = genai.Client(api_key=api_key)
+        _client = anthropic.Anthropic(api_key=api_key)
     return _client
 
 
-def _config(system_instruction: str = SYSTEM_PROMPT) -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        tools=[TOOLS],
-        temperature=0.2,
-        # We drive the loop ourselves for transparency / control.
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-            disable=True
-        ),
-    )
+def _final_text(message) -> str:
+    """Concatenate the text blocks of a Claude response."""
+    return "".join(
+        block.text for block in message.content if block.type == "text"
+    ).strip()
 
 
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
 def run_chat(message: str) -> str:
-    """Run one user turn through Gemini with manual function calling.
+    """Run one user turn through Claude with manual tool execution.
 
     Returns the model's final synthesized natural-language reply.
     """
     client = _get_client()
-    config = _config(SYSTEM_PROMPT + _dataset_context())
-
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part.from_text(text=message)])
-    ]
+    system = SYSTEM_PROMPT + _dataset_context()
+    messages: list[dict] = [{"role": "user", "content": message}]
 
     for _ in range(_MAX_TOOL_ROUNDS):
-        response = client.models.generate_content(
+        response = client.messages.create(
             model=MODEL,
-            contents=contents,
-            config=config,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
         )
 
-        function_calls = response.function_calls
-        if not function_calls:
+        if response.stop_reason != "tool_use":
             # No tool requested -> this is the final answer.
-            return (response.text or "").strip()
+            return _final_text(response)
 
-        # Append the model's tool-calling turn verbatim.
-        contents.append(response.candidates[0].content)
+        # Append Claude's tool-calling turn verbatim (preserves tool_use blocks).
+        messages.append({"role": "assistant", "content": response.content})
 
-        # Execute every requested tool call and append the results.
-        for fc in function_calls:
-            tool = TOOL_REGISTRY.get(fc.name)
+        # Execute every requested tool call and collect the results.
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            tool = TOOL_REGISTRY.get(block.name)
             if tool is None:
-                result = {"error": f"Unknown tool '{fc.name}'."}
+                result = {"error": f"Unknown tool '{block.name}'."}
             else:
                 try:
-                    result = tool(**dict(fc.args))
+                    result = tool(**dict(block.input))
                 except Exception as exc:  # surface errors to the model, don't crash
                     result = {"error": str(exc)}
-
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=fc.name,
-                            response={"result": result},
-                        )
-                    ],
-                )
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result),
+                }
             )
 
-    # Loop exhausted -> ask once more for a plain answer.
-    final = client.models.generate_content(
-        model=MODEL, contents=contents, config=config
+        messages.append({"role": "user", "content": tool_results})
+
+    # Loop exhausted -> ask once more for a plain answer (no tools).
+    final = client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=system,
+        messages=messages,
     )
-    return (final.text or "").strip()
+    return _final_text(final)
