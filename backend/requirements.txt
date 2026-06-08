@@ -3,7 +3,9 @@
 
 # --- Web framework ---
 fastapi==0.115.6
-uvicorn[standard]==0.34.0
+uvicorn[standard]==0.34.0        # local dev server (HTTP/1)
+hypercorn>=0.17                  # prod server on Cloud Run — speaks HTTP/2 (h2c),
+                                 # which lifts Cloud Run's 32MB HTTP/1 upload cap
 python-multipart==0.0.20        # required by FastAPI for multipart/form-data uploads
 python-dotenv==1.0.1
 
